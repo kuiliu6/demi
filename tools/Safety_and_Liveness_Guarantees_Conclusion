@@ -1,0 +1,86 @@
+3/3: Safety and Liveness Guarantees, Conclusion
+Titus von Köller
+January 23, 2017
+11 minutes Read
+This series of three blog posts will give readers an overview on why the Raft consensus algorithm is relevant and summarizes the functionality that makes it work. The 3 posts are divided as follows:
+
+Part 1/3: Introduction to the problem of consensus, why it matters (even to non-PhDs), how the specification of the Raft algorithm is an important contribution to the field and a peek at the actual real-world uses of consensus algorithms.
+Part 2/3: Overview over the core mechanics that constitute the Raft algorithm itself
+Part 3/3: Why the algorithm works even on edge cases, with an overview of the algorithm's safety and liveness properties. This is then followed by the conclusion on the insights gained from looking at the Raft protocol.
+Safety and Liveness
+The combination of leader election and log replication commitment rules provide Raft’s safety guarantees: Correctness and availability of the system remains guaranteed as long as a majority of the servers remain up.
+
+Safety can be informally described as nothing bad happens and liveness as something good eventually happens.
+
+Elections
+Safety: For each term, every server gives out one and only one vote and, consequently, two different candidates can never accumulate majorities within the same term. This vote needs to be reliably persisted on disk, in order to account for the possibility of servers failing and recovering within the same term.
+
+Liveness: Theoretically, competing candidates could cause repeated split votes. Raft mitigates this by having each participating server individually choose a new random timeout within each given interval. This will lead to a situation, where usually there is only one server awake, which can then win the election while every other server is still asleep. This works best if the lower bound of the chosen interval is considerably larger than the broadcast time.
+
+Commitment
+Safety in the commitment step is guaranteed by only allowing commitment for log entries that are replicated on a majority of servers and that are from the current leader’s term or the items preceding an AppendEntries RPC (may also be a heartbeat/ empty RPC) from the current term. The moment a leader decides an entry is committed, it is from then on guaranteed that this entry will be contained in the logs of all future leaders.
+
+A leader can never overwrite entries in their own log, they can only append. In order to be committed, the entry must be present in the leader’s log and, only once committed, can be applied to the state machine. This gives us the combined property that once a log entry has been applied to one state machine, no other command may be applied to a different state machine for that specific log entry (specified by term and index).
+
+Picking the Best Leader
+Safety: In leader elections, candidates include the lastTerm and lastIndex of their last log entry and, based on this information, other servers, deny their vote if their own log is more complete. This is the case if the voting server has either participated in a higher term or the same term, but having a higher lastIndex (and therefore a longer log).
+
+Making Logs Consistent
+Safety: If an AppendEntries RPC to a follower fails because there are missing entries, for every failed call the nextIndex of that follower will be decremented and the call will be tried again until eventually the last item in the log is reached and the log filled up to mirror the leader’s log.
+
+In case an AppendEntries RPC to a follower returns that there is already an entry at that point in the followers log, this entry will be considered extraneous – as the leader’s log is considered authoritative – and be overwritten. This will also invalidate all consecutive entries on the follower, as all entries following an extraneous entry are also extraneous.
+
+Neutralizing Old Leaders
+Safety: A leader might be separated from a majority of other servers by a partition and during this time, these would then elect a new leader. With a new leader in place, the protocol will continue on that side of the partition, but once the deposed leader becomes reconnected to the rest of the servers, the protocol needs to take care of the situation where two servers think they are leader. The stale leader would behave according to its perceived role and try to replicate logs, talk to the client, record logs, or commit log entries. This would be unsafe and needs to be dealt with by the protocol.
+
+Terms are the mechanism by which the protocol takes care of stale leaders. All possible RPCs always include the term of the sender and the comparison of sender’s to receiver’s term leads to the updating of the more out-of-date. Additionally, in case of an older sender’s term, the RPC gets rejected and the sender reverts to follower or, in case of an older receiver’s term, the receiver reverts to follower and then processes the RPC normally.
+
+The key to understanding safety in regard to any situation with stale leaders or candidates is to become aware that any election necessarily updates the terms within a majority of servers. Therefore, once a leader is stale, it is impossible within the mechanics of the protocol for it to commit any new log entries.
+
+Client Relations
+Clients of the Raft protocol interact with it through the leader. Only once a command has been logged, committed, and executed on the state machine of the leader, will he then respond.
+
+Availability: If the leader is unknown or the request times out (e.g. leader crash), the client may contact any of the servers, which will then redirect to the (new) leader, where the request will then be retried. This guarantees that the command will eventually be executed if a majority of the servers are still alive.
+
+Safety: Yet, in order to make sure that commands are not duplicated, there is an additional property: Every command is paired with a unique command id, which assures that the leader is aware of the situation and that execution of the command as well as the response happen only once for every unique command.
+
+Configuration Changes
+In Raft the process of applying configuration changes in regard to the participating servers – a need in real-world systems – is part of the specification of the protocol. Without this mechanism, changes in configuration could be obtained through taking the cluster off-line, then taking it online again with a new configuration, but this would not retain availability.
+
+Essentially, the changes in a configuration C are encapsulated within a two-phase transition, during which there is overlapping partial knowledge of the configuration changes C_old→C_old+new→C_new across the servers:
+
+In the first phase,
+the client requests the leader to transition from C_old to C_new. The leader then issues an AppendEntry RPC to add a special entry to the log containing the configuration C_old+new. This intended configuration change then gets proliferated through log replication.
+
+As soon as a server adds a configuration change entry to its log, it starts to immediately act based on that knowledge of C_old+new (not just after commit!). Until the commit, it is still possible that a majority of the servers, without the new knowledge, act purely based on the old configuration and take over the cluster (i.e. if the leader crashes).
+
+Once the configuration change log entry has been replicated to a majority of servers, the next phase begins as now consensus cannot be reached based on C_old anymore.
+
+The second phase
+starts the moment that the log entry with the configuration change has been committed. Starting from this point in time, the protocol needs a majority of the union of the old as well as new configuration, that is C_old+new, for commitment.
+
+Under these circumstances, it is safe for the leader to issue another log entry that specifies C_new and to replicate it across the other servers. Once appended to a server’s log, this configuration change will again immediately take effect on that server. Once this new configuration is committed through replication on a majority of C_new, the old configuration becomes irrelevant and the now superfluous servers may then be shut down.
+
+Availability is guaranteed in this scenario, as the cluster remains up during the entire reconfiguration process and progress is guaranteed by the same mechanisms as the rest of the protocol.
+
+Safety is guaranteed, as it is not possible at any point of the transition that the cluster may split into two independent majorities and so it is impossible for two leaders to be elected at the same time.
+
+Conclusion
+In theoretical computer science, there comes great benefit from reducing problems to their abstract core. Paxos has taken this approach and revolutionized distributed systems by showing how fault-tolerant consensus can be made workable. Since then, many years have passed and experience dealing with Paxos in both understanding and implementation have shown that it is in some aspects both hard to understand and far from the real-world challenges of implementations.
+
+Understanding is made unnecessarily hard by a state-space that is larger than needed to have the same guarantees as Paxos. Specifically, when used as Multi-Paxos within a replicated state machine, functional segregation of the intertwined parts of the protocol is not given with the same rigor and formal specification as with Raft. Implementation of Paxos is hard, as the protocol is specified in a way that is detached from real-world implementation issues and use cases: The original guarantees and proofs given in theory may not hold anymore in practice. This leads to Paxos implementations needing extensive proofs and verification of their own, detaching them further from the original theoretical results.
+
+In my opinion, the Raft paper is exceptional in that it combines insights into the nature of real-world use-cases and the power of abstract reasoning and combines the two in a way that is not only understandable and tractable while giving hard theoretical guarantees, but also easily reproducible in real-world systems.
+
+References
+In search of an understandable consensus algorithm. Ongaro, Diego, & Ousterhout  (2014) USENIX Annual Technical Conference (USENIX ATC 14).
+
+ARC: analysis of Raft consensus. Howard (2014). Technical Report UCAM-CL-TR-857.
+
+Consensus in the Cloud: Paxos Systems Demystified Ailijiang, Charapko, & Demirbas (2016). The 25th International Conference on Computer Communication and Networks (ICCCN).
+
+Paxos made live: an engineering perspective. Chandra, Griesemer, & Redstone (2007). Proceedings of the twenty-sixth annual ACM symposium on Principles of distributed computing.
+
+Official overview website of materials on and implementations of Raft
+
+Video lecture on Raft: https://youtu.be/YbZ3zDzDnrw
